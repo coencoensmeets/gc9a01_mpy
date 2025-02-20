@@ -57,8 +57,9 @@ extern "C" {
 #define BLACK   0x0000
 #define BLUE    0x001F
 #define RED     0xF800
+#define PINK    0xF81F
 #define GREEN   0x07E0
-#define CYAN    0x07FF
+#define CYAN    0x07F
 #define MAGENTA 0xF81F
 #define YELLOW  0xFFE0
 #define WHITE   0xFFFF
@@ -66,6 +67,32 @@ extern "C" {
 #define OPTIONS_WRAP_V 0x01
 #define OPTIONS_WRAP_H 0x02
 #define OPTIONS_WRAP   0x03
+
+typedef struct _Point
+{
+    mp_float_t x;
+    mp_float_t y;
+} Point;
+
+typedef struct _Polygon
+{
+    mp_int_t length;
+    Point *points;
+} Polygon;
+
+typedef struct _BoundingBox
+{
+    Point topLeft;
+    Point bottomRight;
+} BoundingBox;
+
+typedef struct _BoundingBoxArray
+{
+    mp_int_t length;
+    BoundingBox *boxes;
+    mp_int_t screenWidth;
+    mp_int_t screenHeight;
+} BoundingBoxArray;
 
 #ifdef  __cplusplus
 }

@@ -108,17 +108,6 @@ typedef struct _gc9a01_GC9A01_obj_t {
     uint16_t max_y;                                 // bounding box maximum y
 } gc9a01_GC9A01_obj_t;
 
-// Point and Polygon structures
-typedef struct _Point {
-    mp_float_t x;
-    mp_float_t y;
-} Point;
-
-typedef struct _Polygon {
-    mp_int_t length;
-    Point *points;
-} Polygon;
-
 ///
 /// ### GC9A01(`spi`, `width`, `height`  {, `reset`, `dc`, `cs`, `backlight`, `rotation`, `options`, `buffer_size`})
 ///
@@ -549,25 +538,7 @@ static mp_obj_t gc9a01_GC9A01_circle(size_t n_args, const mp_obj_t *args) {
 
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_circle_obj, 5, 5, gc9a01_GC9A01_circle);
 
-
-/// #### .fill_circle(`x`, `y`, `r`, `color`)
-/// Draw a filled circle.
-///
-///     * **Required Parameters:**
-///         * ``x``: x position of the center
-///         * ``y``: y position of the center
-///         * ``r``: radius
-///         * ``color``: color of the circle
-///
-/// Circle/Fill_Circle by https://github.com/c-logic
-/// https://github.com/russhughes/st7789_mpy/pull/46 https://github.com/c-logic/st7789_mpy.git patch-1
-
-static mp_obj_t gc9a01_GC9A01_fill_circle(size_t n_args, const mp_obj_t *args) {
-    gc9a01_GC9A01_obj_t *self = MP_OBJ_TO_PTR(args[0]);
-    mp_int_t xm = mp_obj_get_int(args[1]);
-    mp_int_t ym = mp_obj_get_int(args[2]);
-    mp_int_t r = mp_obj_get_int(args[3]);
-    mp_int_t color = mp_obj_get_int(args[4]);
+static void fill_circle_c(gc9a01_GC9A01_obj_t *self, mp_int_t xm, mp_int_t ym, mp_int_t r, mp_int_t color) {
     mp_int_t f = 1 - r;
     mp_int_t ddF_x = 1;
     mp_int_t ddF_y = -2 * r;
@@ -590,30 +561,152 @@ static mp_obj_t gc9a01_GC9A01_fill_circle(size_t n_args, const mp_obj_t *args) {
         fast_vline(self, xm - x, ym - y, 2 * y + 1, color);
         fast_vline(self, xm - y, ym - x, 2 * x + 1, color);
     }
+}
+
+static double safe_tan(double angle){
+    double tolerance = 0.0001; // Define a small tolerance
+    double mod_angle = fmod(angle, 2*MP_PI);
+
+    // Check if mod_angle is within tolerance of MP_PI/2 or 3*MP_PI/2
+    if ((fabs(mod_angle - MP_PI/2) < tolerance) || (fabs(mod_angle - 3*MP_PI/2) < tolerance)) {
+        return 0.0;
+    }
+    else{
+        return tan(angle);
+    }
+}
+
+// Fill circle with start and stop angles
+// For a fully filled circle use fill_circle_c as it does not need to calculate the angles.
+// Works for angles from 0 to 180 degrees. Bigger pie pieces can be split up using fill_pie_c
+static void fill_pie_backend_c(gc9a01_GC9A01_obj_t *self, mp_int_t xm, mp_int_t ym, mp_int_t r, mp_int_t color, mp_int_t start_angle_deg, mp_int_t stop_angle_deg) {
+    mp_float_t start_angle = start_angle_deg * RADIANS;
+    mp_float_t stop_angle = stop_angle_deg * RADIANS;
+
+    // Adjusted checks for quadrant_start_14 and quadrant_stop_14 with tolerance
+    // Adjusted checks for quadrant_start_14 and quadrant_stop_14 with tolerance to work in both directions
+    bool quadrant_start_14 = ((fmod(start_angle + MP_PI / 2, 2 * MP_PI)) <= MP_PI) && ((fmod(start_angle + MP_PI / 2, 2 * MP_PI)) > 0);
+    bool quadrant_stop_14 = ((fmod(stop_angle + MP_PI / 2, 2 * MP_PI)) < MP_PI) && ((fmod(stop_angle + MP_PI / 2, 2 * MP_PI)) >= 0);
+
+    float x_1 =  xm + r * cos(start_angle);
+    float x_2 =  xm + r * cos(stop_angle);
+
+    int x_min;
+    int x_max;
+
+    if (start_angle <= MP_PI && MP_PI <= stop_angle) {
+        x_min = xm-r;
+    }
+    else{
+        x_min = round(MIN(xm, MIN(x_1, x_2)));
+    }
+
+    if ((start_angle <= 0 && 0 <= stop_angle) || stop_angle>=2*MP_PI) {
+        x_max = xm+r;
+    }
+    else{
+        x_max = round(MAX(xm, MAX(x_1, x_2)));
+    }
+
+    float sinacos;
+    float y_top;
+    float y_bottom;
+
+    for (int x_i = x_min; x_i <= x_max; x_i++) {
+        sinacos = sqrt(1-pow((float)(x_i-xm)/r, 2));
+        y_top = ym+r*sinacos;
+        y_bottom = ym-r*sinacos;
+        if (x_i>=xm) {
+            if (quadrant_start_14) {
+                y_top = MIN(y_top, ym - (x_i-xm)*safe_tan(start_angle));
+            }
+            if (quadrant_stop_14) {
+                y_bottom = MAX(y_bottom, ym - (x_i-xm)*safe_tan(stop_angle));
+            }
+        }
+        else{
+            if (!quadrant_start_14) {
+                y_bottom = MAX(y_bottom, ym - (x_i-xm)*safe_tan(start_angle));
+            }
+            if (!quadrant_stop_14) {
+                y_top = MIN(y_top, ym - (x_i-xm)*safe_tan(stop_angle));
+            }
+        }
+
+        fast_vline(self, x_i, round(y_bottom), round(y_top-y_bottom), color);
+    }
+}
+
+static void fill_pie_c(gc9a01_GC9A01_obj_t *self, mp_int_t xm, mp_int_t ym, mp_int_t r, mp_int_t color, mp_int_t start_angle_deg, mp_int_t stop_angle_deg) {
+    if (stop_angle_deg - start_angle_deg>=360){
+        fill_circle_c(self, xm, ym, r, color);
+    }
+    else if (stop_angle_deg-start_angle_deg>180){
+        float half_angle = (float)stop_angle_deg/2;
+        fill_pie_backend_c(self, xm, ym, r, color, start_angle_deg, round(half_angle));
+        fill_pie_backend_c(self, xm, ym, r, color, round(half_angle), stop_angle_deg);
+    }
+    else{
+        fill_pie_backend_c(self, xm, ym, r, color, start_angle_deg, stop_angle_deg);
+    }
+}
+
+/// #### .fill_circle(`x`, `y`, `r`, `color`)
+/// Draw a filled circle.
+///
+///     * **Required Parameters:**
+///         * ``x``: x position of the center
+///         * ``y``: y position of the center
+///         * ``r``: radius
+///         * ``color``: color of the circle
+///
+/// Circle/Fill_Circle by https://github.com/c-logic
+/// https://github.com/russhughes/st7789_mpy/pull/46 https://github.com/c-logic/st7789_mpy.git patch-1
+
+static mp_obj_t gc9a01_GC9A01_fill_circle(size_t n_args, const mp_obj_t *args) {
+    gc9a01_GC9A01_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    mp_int_t x0 = mp_obj_get_int(args[1]);
+    mp_int_t y0 = mp_obj_get_int(args[2]);
+    mp_int_t r = mp_obj_get_int(args[3]);
+    mp_int_t color = mp_obj_get_int(args[4]);
+
+    // Call the fill_circle function
+    fill_circle_c(self, x0, y0, r, color);
 
     return mp_const_none;
 }
 
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_fill_circle_obj, 5, 5, gc9a01_GC9A01_fill_circle);
 
-
-/// #### .fill_rect(`x`, `y`, `w`, `h`, `color`)
-/// Draw a filled rectangle.
+/// #### .fill_pie(`x`, `y`, `r`, `start_angle`, `stop_angle`, `color`)
+/// Draw a filled pie slice.
 ///
 ///     * **Required Parameters:**
-///         * ``x``: x position of the top left corner
-///         * ``y``: y position of the top left corner
-///         * ``w``: width
-///         * ``h``: height
-///         * ``color``: color of the rectangle
+///         * ``x``: x position of the center
+///         * ``y``: y position of the center
+///         * ``r``: radius
+///         * ``start_angle``: start angle in radians
+///         * ``stop_angle``: stop angle in radians
+///         * ``color``: color of the pie pice
 
-static mp_obj_t gc9a01_GC9A01_fill_rect(size_t n_args, const mp_obj_t *args) {
+static mp_obj_t gc9a01_GC9A01_fill_pie(size_t n_args, const mp_obj_t *args) {
     gc9a01_GC9A01_obj_t *self = MP_OBJ_TO_PTR(args[0]);
-    mp_int_t x = mp_obj_get_int(args[1]);
-    mp_int_t y = mp_obj_get_int(args[2]);
-    mp_int_t w = mp_obj_get_int(args[3]);
-    mp_int_t h = mp_obj_get_int(args[4]);
-    mp_int_t color = mp_obj_get_int(args[5]);
+    mp_int_t x0 = mp_obj_get_int(args[1]);
+    mp_int_t y0 = mp_obj_get_int(args[2]);
+    mp_int_t r = mp_obj_get_int(args[3]);
+    mp_int_t start_angle = mp_obj_get_int(args[4]);
+    mp_int_t stop_angle = mp_obj_get_int(args[5]);
+    mp_int_t color = mp_obj_get_int(args[6]);
+
+    // Call the fill_pie_c function
+    fill_pie_c(self, x0, y0, r, color, start_angle, stop_angle);
+
+    return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_fill_pie_obj, 7, 7, gc9a01_GC9A01_fill_pie);
+
+static void fill_rect_c(gc9a01_GC9A01_obj_t *self, mp_int_t x, mp_int_t y, mp_int_t w, mp_int_t h, mp_int_t color) {
     uint16_t right = x + w - 1;
     uint16_t bottom = y + h - 1;
 
@@ -632,12 +725,83 @@ static mp_obj_t gc9a01_GC9A01_fill_rect(size_t n_args, const mp_obj_t *args) {
         fill_color_buffer(self->spi_obj, color, w * h);
         CS_HIGH();
     }
+}
+
+/// #### .fill_rect(`x`, `y`, `w`, `h`, `color`)
+/// Draw a filled rectangle.
+///
+///     * **Required Parameters:**
+///         * ``x``: x position of the top left corner
+///         * ``y``: y position of the top left corner
+///         * ``w``: width
+///         * ``h``: height
+///         * ``color``: color of the rectangle
+
+static mp_obj_t gc9a01_GC9A01_fill_rect(size_t n_args, const mp_obj_t *args) {
+    gc9a01_GC9A01_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    mp_int_t x = mp_obj_get_int(args[1]);
+    mp_int_t y = mp_obj_get_int(args[2]);
+    mp_int_t w = mp_obj_get_int(args[3]);
+    mp_int_t h = mp_obj_get_int(args[4]);
+    mp_int_t color = mp_obj_get_int(args[5]);
+    
+    fill_rect_c(self, x, y, w, h, color);
 
     return mp_const_none;
 }
 
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_fill_rect_obj, 6, 6, gc9a01_GC9A01_fill_rect);
 
+/// #### .fill_rect_rounded(`x`, `y`, `w`, `h`, `color`, `radii`)
+/// Draw a filled rectangle with rounded corners.
+///
+///     * **Required Parameters:**
+///         * ``x``: x position of the top left corner
+///         * ``y``: y position of the top left corner
+///         * ``w``: width
+///         * ``h``: height
+///         * ``color``: color of the rectangle
+///         * ``radii``: array of 4 integers representing the radii of the corners in the order top-left, top-right, bottom-left, bottom-right
+
+static mp_obj_t gc9a01_GC9A01_fill_rect_rounded(size_t n_args, const mp_obj_t *args) {
+    gc9a01_GC9A01_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    mp_int_t x = mp_obj_get_int(args[1]);
+    mp_int_t y = mp_obj_get_int(args[2]);
+    mp_int_t w = mp_obj_get_int(args[3]);
+    mp_int_t h = mp_obj_get_int(args[4]);
+    mp_int_t color = mp_obj_get_int(args[5]);
+    mp_obj_t *radii_items;
+    mp_obj_get_array_fixed_n(args[6], 4, &radii_items);
+    
+    int radius_tl = mp_obj_get_int(radii_items[0]);
+    int radius_tr = mp_obj_get_int(radii_items[1]);
+    int radius_bl = mp_obj_get_int(radii_items[2]);
+    int radius_br = mp_obj_get_int(radii_items[3]);
+
+    // Ensure radii are within the bounds of the rectangle
+    fill_rect_c(self, x + radius_tl, y, w - radius_tl - radius_tr, h, color); // Central rect
+    fill_rect_c(self, x, y + radius_tl, radius_tl, h - radius_tl - radius_bl, color); // Left rect
+    fill_rect_c(self, x + w - radius_tr, y + radius_tr, radius_tr, h - radius_tr - radius_br, color); // Right rect
+    fill_rect_c(self, x +radius_bl, y + h - radius_bl, w - radius_bl - radius_br, radius_bl, color); // Bottom rect
+
+    // Draw the corners using filled circles
+    if (radius_tl > 0) {
+        fill_pie_c(self, x + radius_tl, y + radius_tl+1, radius_tl, color, 90, 180); // Top-left corner
+    }
+    if (radius_tr > 0) {
+        fill_pie_c(self, x + w - radius_tr, y + radius_tr+1, radius_tr, color, 0, 90); // Top-right corner
+    }
+    if (radius_bl > 0) {
+    fill_pie_c(self, x + radius_bl, y + h - radius_bl, radius_bl, color, 180, 270); // Bottom-left corner
+}
+if (radius_br > 0) {
+    fill_pie_c(self, x + w - radius_br, y + h - radius_br, radius_br, color, 270, 360); // Bottom-right corner
+}
+
+    return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_fill_rect_rounded_obj, 7, 7, gc9a01_GC9A01_fill_rect_rounded);
 
 /// #### .fill(`color`)
 /// Fill the entire display with a color.
@@ -709,6 +873,26 @@ static mp_obj_t gc9a01_GC9A01_line(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_line_obj, 6, 6, gc9a01_GC9A01_line);
 
 
+void blit_buffer_c(gc9a01_GC9A01_obj_t *self, const uint8_t *buffer, mp_int_t x, mp_int_t y, mp_int_t w, mp_int_t h) {
+    set_window(self, x, y, x + w - 1, y + h - 1);
+    DC_HIGH();
+    CS_LOW();
+
+    const int buf_size = 256;
+    int limit = w * h * 2;
+    int chunks = limit / buf_size;
+    int rest = limit % buf_size;
+    int i = 0;
+
+    for (; i < chunks; i++) {
+        write_spi(self->spi_obj, buffer + i * buf_size, buf_size);
+    }
+    if (rest) {
+        write_spi(self->spi_obj, buffer + i * buf_size, rest);
+    }
+    CS_HIGH();
+}
+
 /// #### .blit_buffer(`buffer`, `x`, `y`, `w`, `h`)
 /// Copy a color565 bytes() or bytearray() to the display.
 ///
@@ -730,23 +914,7 @@ static mp_obj_t gc9a01_GC9A01_blit_buffer(size_t n_args, const mp_obj_t *args) {
     mp_int_t w = mp_obj_get_int(args[4]);
     mp_int_t h = mp_obj_get_int(args[5]);
 
-    set_window(self, x, y, x + w - 1, y + h - 1);
-    DC_HIGH();
-    CS_LOW();
-
-    const int buf_size = 256;
-    int limit = MIN(buf_info.len, w * h * 2);
-    int chunks = limit / buf_size;
-    int rest = limit % buf_size;
-    int i = 0;
-
-    for (; i < chunks; i++) {
-        write_spi(self->spi_obj, (const uint8_t *)buf_info.buf + i * buf_size, buf_size);
-    }
-    if (rest) {
-        write_spi(self->spi_obj, (const uint8_t *)buf_info.buf + i * buf_size, rest);
-    }
-    CS_HIGH();
+    blit_buffer_c(self, buf_info.buf, x, y, w, h);
 
     return mp_const_none;
 }
@@ -1150,6 +1318,13 @@ static mp_obj_t gc9a01_GC9A01_write(size_t n_args, const mp_obj_t *args) {
 
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_write_obj, 5, 7, gc9a01_GC9A01_write);
 
+// Function to swap the bytes of each color in the palette
+void swap_palette_colors(uint16_t *palette, size_t palette_size) {
+    for (size_t i = 0; i < palette_size; i++) {
+        uint16_t color = palette[i];
+        palette[i] = (color >> 8) | (color << 8);
+    }
+}
 
 /// #### .bitmap(`bitmap`, `x`, `y` {, `idx`})
 /// Draw a bitmap. Supports multiple bitmaps in one module that can be selected by index.
@@ -1177,41 +1352,32 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_write_obj, 5, 7, gc9a01
 /// one may be used to create antialiased characters at the expense of memory use.
 /// If you specify a buffer_size during the display initialization it must be
 /// large enough to hold the one character (HEIGHT * WIDTH * 2).
-
 static mp_obj_t gc9a01_GC9A01_bitmap(size_t n_args, const mp_obj_t *args) {
     gc9a01_GC9A01_obj_t *self = MP_OBJ_TO_PTR(args[0]);
-    mp_obj_module_t *bitmap = MP_OBJ_TO_PTR(args[1]);
+    mp_obj_dict_t *bitmap_dict = MP_OBJ_TO_PTR(args[1]);
     mp_int_t x = mp_obj_get_int(args[2]);
     mp_int_t y = mp_obj_get_int(args[3]);
-    mp_int_t idx;
 
-    if (n_args > 4) {
-        idx = mp_obj_get_int(args[4]);
-    } else {
-        idx = 0;
+    const uint16_t height = mp_obj_get_int(mp_obj_dict_get(bitmap_dict, MP_OBJ_NEW_QSTR(MP_QSTR_HEIGHT)));
+    const uint16_t width = mp_obj_get_int(mp_obj_dict_get(bitmap_dict, MP_OBJ_NEW_QSTR(MP_QSTR_WIDTH)));
+    const uint8_t bpp = mp_obj_get_int(mp_obj_dict_get(bitmap_dict, MP_OBJ_NEW_QSTR(MP_QSTR_BPP)));
+
+    mp_obj_t palette_arg = mp_obj_dict_get(bitmap_dict, MP_OBJ_NEW_QSTR(MP_QSTR_PALETTE));
+    mp_obj_t *palette_objs;
+    size_t palette_len;
+    mp_obj_get_array(palette_arg, &palette_len, &palette_objs);
+
+    uint16_t palette[palette_len];
+    for (size_t i = 0; i < palette_len; i++) {
+        palette[i] = mp_obj_get_int(palette_objs[i]);
     }
+    swap_palette_colors(palette, palette_len);
 
-    mp_obj_dict_t *dict = MP_OBJ_TO_PTR(bitmap->globals);
-    const uint16_t height = mp_obj_get_int(mp_obj_dict_get(dict, MP_OBJ_NEW_QSTR(MP_QSTR_HEIGHT)));
-    const uint16_t width = mp_obj_get_int(mp_obj_dict_get(dict, MP_OBJ_NEW_QSTR(MP_QSTR_WIDTH)));
-    uint16_t bitmaps = 0;
-    const uint8_t bpp = mp_obj_get_int(mp_obj_dict_get(dict, MP_OBJ_NEW_QSTR(MP_QSTR_BPP)));
-    mp_obj_t *palette_arg = mp_obj_dict_get(dict, MP_OBJ_NEW_QSTR(MP_QSTR_PALETTE));
-    mp_obj_t *palette = NULL;
-    size_t palette_len = 0;
-    mp_map_elem_t *elem = dict_lookup(bitmap->globals, MP_OBJ_NEW_QSTR(MP_QSTR_BITMAPS));
 
-    if (elem) {
-        bitmaps = mp_obj_get_int(elem);
-    }
-
-    mp_obj_get_array(palette_arg, &palette_len, &palette);
-
-    mp_obj_t *bitmap_data_buff = mp_obj_dict_get(dict, MP_OBJ_NEW_QSTR(MP_QSTR_BITMAP));
+    mp_obj_t *bitmap_data_buff = mp_obj_dict_get(bitmap_dict, MP_OBJ_NEW_QSTR(MP_QSTR_BITMAP));
     mp_buffer_info_t bufinfo;
-
     mp_get_buffer_raise(bitmap_data_buff, &bufinfo, MP_BUFFER_READ);
-    bitmap_data = bufinfo.buf;
+    uint8_t *bitmap_data = bufinfo.buf;
 
     uint32_t buf_size = width * height * 2;
 
@@ -1220,19 +1386,17 @@ static mp_obj_t gc9a01_GC9A01_bitmap(size_t n_args, const mp_obj_t *args) {
     }
 
     uint32_t ofs = 0;
-
-    bs_bit = 0;
-    if (bitmaps) {
-        if (idx < bitmaps) {
-            bs_bit = height * width * bpp * idx;
-        } else {
-            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("index out of range"));
-        }
-    }
+    uint32_t bs_bit = 0;
 
     for (int yy = 0; yy < height; yy++) {
         for (int xx = 0; xx < width; xx++) {
-            self->i2c_buffer[ofs++] = mp_obj_get_int(palette[get_color(bpp)]);
+            uint8_t color_index = 0;
+            for (int i = 0; i < bpp; i++) {
+                color_index <<= 1;
+                color_index |= (bitmap_data[bs_bit / 8] & (1 << (7 - (bs_bit % 8)))) > 0;
+                bs_bit++;
+            }
+            self->i2c_buffer[ofs++] = palette[color_index];
         }
     }
 
@@ -1266,80 +1430,93 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_bitmap_obj, 4, 5, gc9a0
 ///
 ///     * **Optional Parameters:**
 ///         * ``idx``: index of the bitmap to draw (default: 0)
-
 static mp_obj_t gc9a01_GC9A01_pbitmap(size_t n_args, const mp_obj_t *args) {
     gc9a01_GC9A01_obj_t *self = MP_OBJ_TO_PTR(args[0]);
-    mp_obj_module_t *bitmap = MP_OBJ_TO_PTR(args[1]);
-    mp_int_t x = mp_obj_get_int(args[2]);
-    mp_int_t y = mp_obj_get_int(args[3]);
-    mp_int_t idx;
+    mp_obj_dict_t *bitmap_dict = MP_OBJ_TO_PTR(args[1]);
+    mp_int_t rows_at_once = (n_args > 2) ? mp_obj_get_int(args[2]) : 1;
 
-    if (n_args > 4) {
-        idx = mp_obj_get_int(args[4]);
-    } else {
-        idx = 0;
+    // const uint16_t height = mp_obj_get_int(mp_obj_dict_get(bitmap_dict, MP_OBJ_NEW_QSTR(MP_QSTR_HEIGHT)));
+    const uint16_t width = mp_obj_get_int(mp_obj_dict_get(bitmap_dict, MP_OBJ_NEW_QSTR(MP_QSTR_WIDTH)));
+    const uint8_t bpp = mp_obj_get_int(mp_obj_dict_get(bitmap_dict, MP_OBJ_NEW_QSTR(MP_QSTR_BPP)));
+
+    mp_obj_t palette_arg = mp_obj_dict_get(bitmap_dict, MP_OBJ_NEW_QSTR(MP_QSTR_PALETTE));
+    mp_obj_t *palette_objs;
+    size_t palette_len;
+    mp_obj_get_array(palette_arg, &palette_len, &palette_objs);
+
+    uint16_t palette[palette_len];
+    for (size_t i = 0; i < palette_len; i++) {
+        palette[i] = mp_obj_get_int(palette_objs[i]);
     }
+    swap_palette_colors(palette, palette_len);
 
-    mp_obj_dict_t *dict = MP_OBJ_TO_PTR(bitmap->globals);
-    const uint16_t height = mp_obj_get_int(mp_obj_dict_get(dict, MP_OBJ_NEW_QSTR(MP_QSTR_HEIGHT)));
-    const uint16_t width = mp_obj_get_int(mp_obj_dict_get(dict, MP_OBJ_NEW_QSTR(MP_QSTR_WIDTH)));
-    uint16_t bitmaps = 0;
-    const uint8_t bpp = mp_obj_get_int(mp_obj_dict_get(dict, MP_OBJ_NEW_QSTR(MP_QSTR_BPP)));
-    mp_obj_t *palette_arg = mp_obj_dict_get(dict, MP_OBJ_NEW_QSTR(MP_QSTR_PALETTE));
-    mp_obj_t *palette = NULL;
-    size_t palette_len = 0;
-    mp_map_elem_t *elem = dict_lookup(bitmap->globals, MP_OBJ_NEW_QSTR(MP_QSTR_BITMAPS));
-
-    if (elem) {
-        bitmaps = mp_obj_get_int(elem);
-    }
-
-    mp_obj_get_array(palette_arg, &palette_len, &palette);
-
-    mp_obj_t *bitmap_data_buff = mp_obj_dict_get(dict, MP_OBJ_NEW_QSTR(MP_QSTR_BITMAP));
+    mp_obj_t *bitmap_data_buff = mp_obj_dict_get(bitmap_dict, MP_OBJ_NEW_QSTR(MP_QSTR_BITMAP));
     mp_buffer_info_t bufinfo;
-
     mp_get_buffer_raise(bitmap_data_buff, &bufinfo, MP_BUFFER_READ);
-    bitmap_data = bufinfo.buf;
+    uint8_t *bitmap_data = bufinfo.buf;
 
-    uint32_t buf_size = width * 2;
+    mp_obj_t bounding_list = mp_obj_dict_get(bitmap_dict, MP_OBJ_NEW_QSTR(MP_QSTR_BOUNDING));
+    size_t bounding_len;
+    mp_obj_t *bounding_boxes;
+    mp_obj_get_array(bounding_list, &bounding_len, &bounding_boxes);
+
+    uint32_t buf_size = width * rows_at_once * 2;
 
     if (self->buffer_size == 0) {
         self->i2c_buffer = m_malloc(buf_size);
+        self->buffer_size = buf_size;
+    } else if (self->buffer_size < buf_size) {
+        self->i2c_buffer = m_realloc(self->i2c_buffer, buf_size);
+        self->buffer_size = buf_size;
     }
 
-    bs_bit = 0;
-    if (bitmaps) {
-        if (idx < bitmaps) {
-            bs_bit = height * width * bpp * idx;
-        } else {
-            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("index out of range"));
+    for (size_t b = 0; b < bounding_len; b++) {
+        mp_obj_t *bounding_box;
+        mp_obj_get_array_fixed_n(bounding_boxes[b], 2, &bounding_box);
+
+        mp_obj_t *top_left;
+        mp_obj_get_array_fixed_n(bounding_box[0], 2, &top_left);
+        uint16_t x_start = mp_obj_get_int(top_left[0]);
+        uint16_t y_start = mp_obj_get_int(top_left[1]);
+
+        mp_obj_t *bottom_right;
+        mp_obj_get_array_fixed_n(bounding_box[1], 2, &bottom_right);
+        uint16_t x_end = mp_obj_get_int(bottom_right[0]);
+        uint16_t y_end = mp_obj_get_int(bottom_right[1]);
+
+        uint16_t rows_at_once_bounding = fmin(rows_at_once, y_end - y_start + 1);
+
+        for (int yy = y_start; yy <= y_end; yy += rows_at_once_bounding) {
+            uint32_t ofs = 0;
+            uint16_t current_rows = (yy + rows_at_once_bounding> y_end) ? y_end - yy + 1 : rows_at_once_bounding;
+
+            for (int r = 0; r < current_rows; r++) {
+
+                uint32_t bs_bit = ((yy + r) * width + x_start) * bpp;
+                for (int xx = x_start; xx <= x_end; xx++) {
+                    uint8_t color_index = 0;
+                    for (int i = 0; i < bpp; i++) {
+                        color_index = (color_index << 1) | ((bitmap_data[bs_bit / 8] >> (7 - (bs_bit % 8))) & 1);
+                        bs_bit++;
+                    }
+                    self->i2c_buffer[ofs++] = palette[color_index];
+                }
+            }
+
+            set_window(self, x_start, yy, x_end, yy + current_rows - 1);
+            DC_HIGH();
+            CS_LOW();
+            write_spi(self->spi_obj, (uint8_t *)self->i2c_buffer, (x_end - x_start + 1) * current_rows * 2);
+            CS_HIGH();
         }
     }
 
-    uint16_t x1 = x + width - 1;
-
-    for (int yy = 0; yy < height; yy++) {
-        uint32_t ofs = 0;
-
-        for (int xx = 0; xx < width; xx++) {
-            self->i2c_buffer[ofs++] = mp_obj_get_int(palette[get_color(bpp)]);
-        }
-
-        set_window(self, x, y + yy, x1, y + yy);
-        DC_HIGH();
-        CS_LOW();
-        write_spi(self->spi_obj, (uint8_t *)self->i2c_buffer, buf_size);
-        CS_HIGH();
-    }
-
-    if (self->buffer_size == 0) {
-        m_free(self->i2c_buffer);
-    }
     return mp_const_none;
 }
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_pbitmap_obj, 2, 3, gc9a01_GC9A01_pbitmap);
 
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_pbitmap_obj, 4, 5, gc9a01_GC9A01_pbitmap);
+
+
 
 
 /// #### .text(`font`, `string|int`, `x`, `y` {, `fg_color`, `bg_color`})
@@ -1502,7 +1679,7 @@ static void set_rotation(gc9a01_GC9A01_obj_t *self) {
     write_cmd(self, GC9A01_MADCTL, madctl, 1);
 }
 
-/// #### .rotate(`rotation`)
+/// #### .rotation(`rotation`)
 /// Rotate the display to the given orientation.
 ///
 ///     * **Required Parameters:**
@@ -2267,6 +2444,43 @@ static void PolygonFill(gc9a01_GC9A01_obj_t *self, Polygon *polygon, Point locat
     }
 }
 
+static void fill_polygon_c(gc9a01_GC9A01_obj_t *self, size_t poly_len, mp_obj_t *polygon, mp_int_t x, mp_int_t y, mp_int_t color, mp_float_t angle, mp_int_t cx, mp_int_t cy) {
+    self->work = m_malloc(poly_len * sizeof(Point));
+    if (self->work) {
+        Point *point = (Point *)self->work;
+
+        for (int idx = 0; idx < poly_len; idx++) {
+            size_t point_from_poly_len;
+            mp_obj_t *point_from_poly;
+
+            mp_obj_get_array(polygon[idx], &point_from_poly_len, &point_from_poly);
+            if (point_from_poly_len < 2) {
+                mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Polygon data error"));
+            }
+
+            point[idx].x = mp_obj_get_int(point_from_poly[0]);
+            point[idx].y = mp_obj_get_int(point_from_poly[1]);
+        }
+
+        Point location = {x, y};
+        Point center = {cx, cy};
+        Polygon polygon_struct = {poly_len, self->work};
+
+        if (angle != 0) {
+            RotatePolygon(&polygon_struct, &center, angle);
+        }
+
+        draw_polygon_outline(self, x, y, &polygon_struct, color);
+        PolygonFill(self, &polygon_struct, location, color);
+
+        m_free(self->work);
+        self->work = NULL;
+    } else {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Polygon data error"));
+    }
+}
+
+
 /// #### .fill_polygon(`polygon`, `x`, `y`, `color` {, `angle` {, `cx`, `cy`}})
 /// Draw a filled polygon.
 /// The polygon should consist of a list of (x, y) tuples forming a closed polygon.
@@ -2310,40 +2524,7 @@ static mp_obj_t gc9a01_GC9A01_fill_polygon(size_t n_args, const mp_obj_t *args) 
             cy = mp_obj_get_int(args[7]);
         }
 
-        self->work = m_malloc(poly_len * sizeof(Point));
-        if (self->work) {
-            Point *point = (Point *)self->work;
-
-            for (int idx = 0; idx < poly_len; idx++) {
-                size_t point_from_poly_len;
-                mp_obj_t *point_from_poly;
-
-                mp_obj_get_array(polygon[idx], &point_from_poly_len, &point_from_poly);
-                if (point_from_poly_len < 2) {
-                    mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Polygon data error"));
-                }
-
-                point[idx].x = mp_obj_get_int(point_from_poly[0]);
-                point[idx].y = mp_obj_get_int(point_from_poly[1]);
-            }
-
-            Point location = {x, y};
-            Point center = {cx, cy};
-            Polygon polygon = {poly_len, self->work};
-
-            if (angle != 0) {
-                RotatePolygon(&polygon, &center, angle);
-            }
-
-            draw_polygon_outline(self, x, y, &polygon, color);
-            PolygonFill(self, &polygon, location, color);
-
-            m_free(self->work);
-            self->work = NULL;
-        } else {
-            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Polygon data error"));
-        }
-
+        fill_polygon_c(self, poly_len, polygon, x, y, color, angle, cx, cy);
     } else {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Polygon data error"));
     }
@@ -2353,6 +2534,147 @@ static mp_obj_t gc9a01_GC9A01_fill_polygon(size_t n_args, const mp_obj_t *args) 
 
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_fill_polygon_obj, 4, 8, gc9a01_GC9A01_fill_polygon);
 
+void fill_polygon_rounded_c(gc9a01_GC9A01_obj_t *self, size_t poly_len, mp_obj_t *polygon, mp_obj_t *radii, mp_int_t x, mp_int_t y, mp_int_t color) {
+    self->work = m_malloc(poly_len * sizeof(Point));
+    // mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("fill_polygon_rounded_c is called"));
+            
+    if (self->work) {
+        Point *point = (Point *)self->work;
+        int *radii_values = (int *)m_malloc(poly_len * sizeof(int));
+
+        Point minPoint = {INT_MAX, INT_MAX};
+
+        for (size_t idx = 0; idx < poly_len; idx++) {
+            size_t point_from_poly_len;
+            mp_obj_t *point_from_poly;
+
+            mp_obj_get_array(polygon[idx], &point_from_poly_len, &point_from_poly);
+            if (point_from_poly_len < 2) {
+                mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Polygon data error"));
+            }
+
+            point[idx].x = mp_obj_get_int(point_from_poly[0]);
+            point[idx].y = mp_obj_get_int(point_from_poly[1]);
+            radii_values[idx] = mp_obj_get_int(radii[idx]);
+        }
+
+        Polygon polygon = {0};
+        polygon.points = (Point *)m_malloc(poly_len * sizeof(Point) * 2); // Allocate with an assumption of maximum possible size
+        polygon.length = 0;
+        for (size_t i = 0; i < poly_len; ++i) {
+            if (radii_values[i] == 0) {
+                polygon.points[polygon.length++] = point[i];
+                continue;
+            }
+            
+            Point p1 = point[(i + poly_len - 1) % poly_len];
+            Point p2 = point[i];
+            Point p3 = point[(i + 1) % poly_len];
+
+            double angle1 = atan2(p2.y - p1.y, p2.x - p1.x);
+            double angle2 = atan2(p3.y - p2.y, p3.x - p2.x);
+            double theta = (angle2 - angle1) / 2;
+
+            double p2pc = radii_values[i] / cos(theta);
+            double p2pab = sqrt(p2pc * p2pc - radii_values[i] * radii_values[i]);
+            double p1p2 = sqrt((p2.x - p1.x) * (p2.x - p1.x) + (p2.y - p1.y) * (p2.y - p1.y));
+
+            Point pa = { (p1.x + (p1p2 - p2pab) * cos(angle1)),
+                        (p1.y + (p1p2 - p2pab) * sin(angle1)) };
+            Point pb = { (p2.x + p2pab * cos(angle2)),
+                        (p2.y + p2pab * sin(angle2)) };
+
+            double arrow_angle = angle1 + theta + MP_PI / 2;
+            Point pc = { (p2.x + p2pc * cos(arrow_angle)),
+                        (p2.y + p2pc * sin(arrow_angle)) };
+
+            double start_angle = -(arrow_angle - MP_PI + theta);
+            double end_angle = -(arrow_angle - MP_PI - theta);
+            if (end_angle < start_angle) {
+                end_angle += 2 * MP_PI;
+            }
+            
+            // fill_pie_c(self, round(pc.x), round(pc.y), radii_values[i], color, round(start_angle*DEGREES), round(end_angle*DEGREES));
+            // fill_circle_c(self, pc.x, pc.y, radii_values[i], color);
+            polygon.points[polygon.length++] = pa;
+            polygon.points[polygon.length++] = pc;
+            polygon.points[polygon.length++] = pb;
+        }
+
+        minPoint.x = 0;
+        minPoint.y = 0;
+        
+        // mp_printf(&mp_plat_print, "polygon.points[0].x: %d\n", polygon.points[0].x);
+        draw_polygon_outline(self, minPoint.x, minPoint.y, &polygon, color);
+        PolygonFill(self, &polygon, minPoint, color);
+
+        int index = 0;
+        for (int i = 0; i<poly_len; i++){
+            if (radii_values[i] ==0) {
+                fill_circle_c(self, polygon.points[index].x, polygon.points[index].y, radii_values[i], color);
+                index++;
+            }
+            else{
+                fill_circle_c(self, polygon.points[index+1].x, polygon.points[index+1].y, radii_values[i], color);
+                index = index + 3;
+            }
+        }
+
+        m_free(self->work);
+        self->work = NULL;
+    } else {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Polygon data error"));
+    }
+}
+
+/// #### .fill_polygon_rounded(`polygon`, `radii`, `x`, `y`, `color` {, `angle` {, `cx`, `cy`}})
+/// Draw a filled polygon.
+/// The polygon should consist of a list of (x, y) tuples forming a closed polygon.
+/// See `watch.py` for an example.
+///
+///     * **Required Parameters:**
+///         * ``polygon``: polygon to draw
+///         * ``radii``: radii of the corners
+///         * ``x``: column to start at
+///         * ``y``: row to start at
+///         * ``color``: color of the polygon
+///
+///     * **Optional Parameters:**
+///         * ``angle``: angle in radians to rotate the polygon (default: 0.0)
+///         * ``cx``: x coordinate of the center of rotation (default: 0)
+///         * ``cy``: y coordinate of the center of rotation (default: 0)
+
+static mp_obj_t gc9a01_GC9A01_fill_polygon_rounded(size_t n_args, const mp_obj_t *args) {
+    gc9a01_GC9A01_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    size_t poly_len;
+    mp_obj_t *polygon;
+
+    mp_obj_get_array(args[1], &poly_len, &polygon);
+
+    self->work = NULL;
+
+    if (poly_len > 0) {
+        mp_obj_t *radii;
+        size_t radii_len;
+        mp_obj_get_array(args[2], &radii_len, &radii);
+
+        if (radii_len != poly_len) {
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Radii length must match polygon length"));
+        }
+
+        mp_int_t x = mp_obj_get_int(args[3]);
+        mp_int_t y = mp_obj_get_int(args[4]);
+        mp_int_t color = mp_obj_get_int(args[5]);
+
+        fill_polygon_rounded_c(self, poly_len, polygon, radii, x, y, color);
+    } else {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Polygon data error"));
+    }
+
+    return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_fill_polygon_rounded_obj, 6, 6, gc9a01_GC9A01_fill_polygon_rounded);
 
 void draw_arc(gc9a01_GC9A01_obj_t *self, uint16_t x, uint16_t y, int16_t start_angle_degrees, int16_t end_angle_degrees, uint16_t segments, uint16_t radius_x, uint16_t radius_y, uint16_t arc_width, uint16_t color) {
 
@@ -2526,6 +2848,86 @@ static mp_obj_t gc9a01_GC9A01_fill_arc(size_t n_args, const mp_obj_t *args) {
 
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_fill_arc_obj, 9, 9, gc9a01_GC9A01_fill_arc);
 
+// Assuming create_buffer_with_rectangle() is defined elsewhere
+void set_pixel_color(uint8_t *buffer, int x, int y, int w, uint16_t color) {
+    int index = (y * w + x) * 2; // Calculate the index for the pixel
+    buffer[index] = color >> 8; // Set the high byte
+    buffer[index + 1] = color & 0xFF; // Set the low byte
+}
+
+// Main function to create the buffer
+uint8_t* create_buffer_with_rectangle(int x, int y, int w, int h, int (*rect_coords)[2]) {
+    // Calculate buffer size and allocate memory
+    int bufferSize = w * h * 2; // 2 bytes per pixel
+    mp_printf(&mp_plat_print, "Buffer size: %d\n", bufferSize); // Print buffer size
+    // mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Test1"));
+    uint8_t *buffer = m_malloc(bufferSize);
+    
+    mp_printf(&mp_plat_print, "Buffer: %p\n", buffer); // Print buffer address
+    if (!buffer) return NULL; // Return NULL if memory allocation fails
+
+    // Initialize buffer to black
+    memset(buffer, 0, bufferSize);
+    mp_printf(&mp_plat_print, "Buffer initialized to black\n");
+
+    // Determine the bounds of the rectangle
+    int rect_x1 = rect_coords[0][0];
+    int rect_y1 = rect_coords[0][1];
+    int rect_x2 = rect_coords[2][0];
+    int rect_y2 = rect_coords[2][1];
+    // Draw the rectangle in white
+    for (int rect_y = rect_y1; rect_y <= rect_y2; rect_y++) {
+        for (int rect_x = rect_x1; rect_x <= rect_x2; rect_x++) {
+            // mp_printf(&mp_plat_print, "Setting pixel at (%d, %d)\n", rect_x, rect_y); // Print pixel coordinates
+            set_pixel_color(buffer, rect_x - x, rect_y - y, w, 0xFFFF); // Set pixel to white
+        }
+    }
+
+    return buffer;
+}
+static mp_obj_t gc9a01_GC9A01_test_functions(size_t n_args, const mp_obj_t *args) {
+    gc9a01_GC9A01_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    mp_printf(&mp_plat_print, "Test function called\n");
+
+    // Extract bounding box from args
+    mp_obj_t *bounding_box;
+    mp_obj_get_array_fixed_n(args[1], 4, &bounding_box);
+    int x = mp_obj_get_int(bounding_box[0]);
+    int y = mp_obj_get_int(bounding_box[1]);
+    int width = mp_obj_get_int(bounding_box[2]);
+    int height = mp_obj_get_int(bounding_box[3]);
+    mp_printf(&mp_plat_print, "Bounding box: (%d, %d, %d, %d)\n", x, y, width, height);
+
+    // Extract rect_coords from args
+    mp_obj_t *rect_coords_obj;
+    mp_obj_get_array_fixed_n(args[2], 4, &rect_coords_obj);
+    int rect_coords[4][2];
+    for (size_t i = 0; i < 4; i++) {
+        mp_obj_t *coord;
+        mp_obj_get_array_fixed_n(rect_coords_obj[i], 2, &coord);
+        rect_coords[i][0] = mp_obj_get_int(coord[0]);
+        rect_coords[i][1] = mp_obj_get_int(coord[1]);
+    }
+    mp_printf(&mp_plat_print, "Rectangle coordinates: (%d, %d), (%d, %d), (%d, %d), (%d, %d)\n", rect_coords[0][0], rect_coords[0][1], rect_coords[1][0], rect_coords[1][1], rect_coords[2][0], rect_coords[2][1], rect_coords[3][0], rect_coords[3][1]);
+
+    // Create a buffer with a rectangle
+    mp_printf(&mp_plat_print, "Creating buffer with rectangle\n");
+    uint8_t* buffer = create_buffer_with_rectangle(x, y, width, height, rect_coords);
+    // mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Test1"));
+
+    mp_printf(&mp_plat_print, "Blitting buffer\n");
+    if (buffer) {
+        blit_buffer_c(self, buffer, x, y, width, height);
+
+        // Free the allocated buffer after use
+        free(buffer);
+    }
+
+    return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gc9a01_GC9A01_test_functions_obj, 3, 3, gc9a01_GC9A01_test_functions);
+
 
 /// #### .bounding({`status` {, `as_rect`}})
 /// Enables or disables tracking the display area that has been written to. Initially, tracking is disabled.
@@ -2658,10 +3060,12 @@ static const mp_rom_map_elem_t gc9a01_GC9A01_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_bitmap), MP_ROM_PTR(&gc9a01_GC9A01_bitmap_obj)},
     { MP_ROM_QSTR(MP_QSTR_pbitmap), MP_ROM_PTR(&gc9a01_GC9A01_pbitmap_obj)},
     { MP_ROM_QSTR(MP_QSTR_fill_circle), MP_ROM_PTR(&gc9a01_GC9A01_fill_circle_obj)},
+    { MP_ROM_QSTR(MP_QSTR_fill_pie), MP_ROM_PTR(&gc9a01_GC9A01_fill_pie_obj)},
     { MP_ROM_QSTR(MP_QSTR_circle), MP_ROM_PTR(&gc9a01_GC9A01_circle_obj)},
     { MP_ROM_QSTR(MP_QSTR_arc), MP_ROM_PTR(&gc9a01_GC9A01_arc_obj) },
     { MP_ROM_QSTR(MP_QSTR_fill_arc), MP_ROM_PTR(&gc9a01_GC9A01_fill_arc_obj) },
     { MP_ROM_QSTR(MP_QSTR_fill_rect), MP_ROM_PTR(&gc9a01_GC9A01_fill_rect_obj) },
+    { MP_ROM_QSTR(MP_QSTR_fill_rect_rounded), MP_ROM_PTR(&gc9a01_GC9A01_fill_rect_rounded_obj) },
     { MP_ROM_QSTR(MP_QSTR_fill), MP_ROM_PTR(&gc9a01_GC9A01_fill_obj) },
     { MP_ROM_QSTR(MP_QSTR_hline), MP_ROM_PTR(&gc9a01_GC9A01_hline_obj) },
     { MP_ROM_QSTR(MP_QSTR_vline), MP_ROM_PTR(&gc9a01_GC9A01_vline_obj) },
@@ -2677,6 +3081,8 @@ static const mp_rom_map_elem_t gc9a01_GC9A01_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_polygon_center), MP_ROM_PTR(&gc9a01_GC9A01_polygon_center_obj)},
     { MP_ROM_QSTR(MP_QSTR_polygon), MP_ROM_PTR(&gc9a01_GC9A01_polygon_obj)},
     { MP_ROM_QSTR(MP_QSTR_fill_polygon), MP_ROM_PTR(&gc9a01_GC9A01_fill_polygon_obj)},
+    { MP_ROM_QSTR(MP_QSTR_fill_polygon_rounded), MP_ROM_PTR(&gc9a01_GC9A01_fill_polygon_rounded_obj)},
+    { MP_ROM_QSTR(MP_QSTR_test_functions), MP_ROM_PTR(&gc9a01_GC9A01_test_functions_obj)},
     { MP_ROM_QSTR(MP_QSTR_bounding), MP_ROM_PTR(&gc9a01_GC9A01_bounding_obj)},
 };
 static MP_DEFINE_CONST_DICT(gc9a01_GC9A01_locals_dict, gc9a01_GC9A01_locals_dict_table);
